@@ -1,1 +1,722 @@
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { Mic, Play, Square, Plus, Trash2, Music, Volume2, Settings, AlertCircle, GripVertical, Info } from 'lucide-react';
+
+// --- Constants & Helpers ---
+const NOTES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+const OCTAVES = [3, 4, 5]; // Range C3 to B5
+const DEFAULT_BPM = 120;
+
+// Grid Dimensions
+const CELL_HEIGHT = 40; 
+const CELL_WIDTH = 40;  
+
+const getMidiNote = (noteName, octave) => {
+  const noteIndex = NOTES.indexOf(noteName);
+  return noteIndex + (octave + 1) * 12;
+};
+
+const PIANO_KEYS = [];
+OCTAVES.slice().reverse().forEach(octave => {
+  NOTES.slice().reverse().forEach(note => {
+    PIANO_KEYS.push({ note, octave, midi: getMidiNote(note, octave) });
+  });
+});
+
+const Button = ({ children, onClick, variant = 'primary', className = '', disabled = false, ...props }) => {
+  const baseStyle = "px-4 py-2 rounded-lg font-medium transition-all duration-200 flex items-center justify-center gap-2 active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed touch-manipulation select-none";
+  const variants = {
+    primary: "bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-500/20",
+    secondary: "bg-slate-700 hover:bg-slate-600 text-slate-200",
+    danger: "bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/50",
+    icon: "p-2 rounded-full hover:bg-slate-700 text-slate-300"
+  };
+  return (
+    <button onClick={onClick} className={`${baseStyle} ${variants[variant]} ${className}`} disabled={disabled} {...props}>
+      {children}
+    </button>
+  );
+};
+
+// --- Main App Component ---
+
+export default function VocalSynthApp() {
+  const [activeTab, setActiveTab] = useState('voicebank');
+  const [voicebank, setVoicebank] = useState([
+    { id: 'vb1', name: 'Ah', buffer: null, duration: 0, rootNote: 60 },
+  ]);
+  const [notes, setNotes] = useState([]);
+  const [bpm, setBpm] = useState(120);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [playbackTime, setPlaybackTime] = useState(0);
+  const [selectedNoteId, setSelectedNoteId] = useState(null);
+  
+  // Audio Refs
+  const audioContextRef = useRef(null);
+  const reverbNodeRef = useRef(null);
+  const compressorRef = useRef(null);
+  const schedulerRef = useRef(null);
+  const nextNoteTimeRef = useRef(0);
+  const stepIndexRef = useRef(0);
+
+  // State Refs (Critical for the audio loop to see current data)
+  const playingRef = useRef(false);
+  const notesRef = useRef(notes);
+  const bpmRef = useRef(bpm);
+  const voicebankRef = useRef(voicebank);
+
+  useEffect(() => { notesRef.current = notes; }, [notes]);
+  useEffect(() => { bpmRef.current = bpm; }, [bpm]);
+  useEffect(() => { voicebankRef.current = voicebank; }, [voicebank]);
+  useEffect(() => { playingRef.current = isPlaying; }, [isPlaying]);
+
+  // Interaction Refs
+  const gridRef = useRef(null);
+  const [dragState, setDragState] = useState(null); 
+  const GRID_COLS = 32; 
+
+  // --- Audio Engine ---
+
+  const initAudio = async () => {
+    if (!audioContextRef.current) {
+      const AudioContext = window.AudioContext || window.webkitAudioContext;
+      audioContextRef.current = new AudioContext();
+      const ctx = audioContextRef.current;
+
+      // Master Compressor (glues grains together)
+      compressorRef.current = ctx.createDynamicsCompressor();
+      compressorRef.current.threshold.value = -20;
+      compressorRef.current.knee.value = 30;
+      compressorRef.current.ratio.value = 12;
+      compressorRef.current.attack.value = 0.003;
+      compressorRef.current.release.value = 0.25;
+      compressorRef.current.connect(ctx.destination);
+      
+      // Reverb Impulse
+      reverbNodeRef.current = ctx.createConvolver();
+      const rate = ctx.sampleRate;
+      const length = rate * 2.0; // 2s tail
+      const decay = 4.0;
+      const impulse = ctx.createBuffer(2, length, rate);
+      const impulseL = impulse.getChannelData(0);
+      const impulseR = impulse.getChannelData(1);
+      
+      for (let i = 0; i < length; i++) {
+        const n = i;
+        const env = Math.pow(1 - n / length, decay);
+        impulseL[i] = (Math.random() * 2 - 1) * env;
+        impulseR[i] = (Math.random() * 2 - 1) * env;
+      }
+      
+      reverbNodeRef.current.buffer = impulse;
+      
+      // Reverb Mix
+      const reverbGain = ctx.createGain();
+      reverbGain.gain.value = 0.4; // 40% Wet
+      reverbNodeRef.current.connect(reverbGain);
+      reverbGain.connect(compressorRef.current);
+      
+    } else if (audioContextRef.current.state === 'suspended') {
+      audioContextRef.current.resume();
+    }
+  };
+
+  const handleRecord = async (slotId) => {
+    await initAudio();
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mediaRecorder = new MediaRecorder(stream);
+      const chunks = [];
+
+      mediaRecorder.ondataavailable = (e) => chunks.push(e.data);
+      mediaRecorder.onstop = async () => {
+        const blob = new Blob(chunks, { type: 'audio/ogg; codecs=opus' });
+        const arrayBuffer = await blob.arrayBuffer();
+        const audioBuffer = await audioContextRef.current.decodeAudioData(arrayBuffer);
+        
+        setVoicebank(prev => prev.map(slot => 
+          slot.id === slotId ? { ...slot, buffer: audioBuffer, duration: audioBuffer.duration } : slot
+        ));
+        stream.getTracks().forEach(track => track.stop());
+      };
+
+      mediaRecorder.start();
+      return () => mediaRecorder.stop();
+    } catch (err) {
+      console.error("Microphone access failed:", err);
+      // Using custom modal style instead of alert
+      const errorDiv = document.createElement('div');
+      errorDiv.className = 'fixed inset-0 bg-black/70 flex items-center justify-center z-[100]';
+      errorDiv.innerHTML = `
+        <div class="bg-slate-800 p-6 rounded-lg shadow-2xl max-w-sm">
+          <h3 class="text-xl font-bold text-red-400 mb-3">Error</h3>
+          <p class="text-slate-300">Microphone access was denied or failed. Please check your browser permissions.</p>
+          <button onclick="this.parentNode.parentNode.remove()" class="mt-4 bg-indigo-600 text-white px-4 py-2 rounded-lg w-full">Close</button>
+        </div>
+      `;
+      document.body.appendChild(errorDiv);
+    }
+  };
+
+  // --- SMOOTH GRANULAR SYNTHESIS ---
+  const playNote = (midi, lyric, time = 0, duration = 1) => {
+    if (!audioContextRef.current) initAudio();
+    const ctx = audioContextRef.current;
+    
+    const currentVoicebank = voicebankRef.current;
+    const slot = currentVoicebank.find(v => v.name.toLowerCase() === lyric.toLowerCase()) || currentVoicebank[0];
+    if (!slot || !slot.buffer) return;
+
+    const buffer = slot.buffer;
+    const now = ctx.currentTime + time;
+
+    // Pitch Math
+    const semitoneRatio = Math.pow(2, 1/12);
+    const semitoneDistance = midi - slot.rootNote;
+    const playbackRate = Math.pow(semitoneRatio, semitoneDistance);
+    
+    const scaledBufferDuration = buffer.duration / playbackRate;
+
+    // Bus Routing
+    const voiceBus = ctx.createGain();
+    voiceBus.gain.value = 0.8; // Headroom
+    voiceBus.connect(compressorRef.current);
+    if (reverbNodeRef.current) voiceBus.connect(reverbNodeRef.current);
+
+    // --- SHORT SAMPLE MODE ---
+    if (duration <= scaledBufferDuration || buffer.duration < 0.2) {
+        const source = ctx.createBufferSource();
+        source.buffer = buffer;
+        source.playbackRate.value = playbackRate;
+        source.connect(voiceBus);
+        
+        // ADSR
+        voiceBus.gain.setValueAtTime(0, now);
+        voiceBus.gain.linearRampToValueAtTime(1, now + 0.05);
+        voiceBus.gain.setValueAtTime(1, now + duration - 0.1);
+        voiceBus.gain.linearRampToValueAtTime(0, now + duration);
+        
+        source.start(now);
+        source.stop(now + duration + 0.1);
+        return;
+    }
+
+    // --- STRETCH MODE (High Density Scanning Granular) ---
+    
+    // 1. Attack (First 30% of original sample)
+    const attackDur = Math.min(0.4, buffer.duration * 0.3);
+    const attackNode = ctx.createBufferSource();
+    attackNode.buffer = buffer;
+    attackNode.playbackRate.value = playbackRate;
+    
+    const attackGain = ctx.createGain();
+    attackNode.connect(attackGain);
+    attackGain.connect(voiceBus);
+    
+    attackGain.gain.setValueAtTime(0, now);
+    attackGain.gain.linearRampToValueAtTime(1, now + 0.02);
+    // Crossfade out into grains
+    attackGain.gain.setValueAtTime(1, now + (attackDur/playbackRate) - 0.1);
+    attackGain.gain.linearRampToValueAtTime(0, now + (attackDur/playbackRate));
+    
+    attackNode.start(now);
+
+    // 2. Sustain Cloud
+    // Grains are picked from the "stable" middle of the sample
+    const poolStart = buffer.duration * 0.35;
+    const poolEnd = buffer.duration * 0.75;
+    const poolLen = poolEnd - poolStart;
+    
+    // Parameters for smoothness
+    const grainSize = 0.12; // 120ms grains
+    const density = 0.03;   // New grain every 30ms (4x overlap = very smooth)
+    
+    let grainTime = now + (attackDur/playbackRate) - 0.1; // Start slightly before attack ends
+    const endTime = now + duration;
+    
+    // Low Pass Filter to remove grain-edge clicks
+    const lpf = ctx.createBiquadFilter();
+    lpf.type = 'lowpass';
+    lpf.frequency.value = 8000; // Soften highs
+    lpf.connect(voiceBus);
+    
+    let safety = 0;
+    // "Scan" pointer moves back and forth through the pool
+    let scanPhase = 0; 
+    
+    while (grainTime < endTime && safety < 1500) {
+        // Scanning Logic: Oscillate through the pool slowly (0.5Hz LFO)
+        const scanPos = (Math.sin(scanPhase) + 1) / 2; // 0 to 1
+        const offset = poolStart + (scanPos * (poolLen * 0.8)); // Use 80% of pool
+        scanPhase += 0.1;
+
+        const src = ctx.createBufferSource();
+        src.buffer = buffer;
+        src.playbackRate.value = playbackRate;
+        
+        const env = ctx.createGain();
+        src.connect(env);
+        env.connect(lpf); // Route through filter
+        
+        // Hanning Window (Cosine Bell) for super smooth overlap
+        // Fade In -> Hold -> Fade Out
+        const startT = grainTime;
+        const endT = grainTime + grainSize;
+        const centerT = startT + (grainSize / 2);
+        
+        env.gain.setValueAtTime(0, startT);
+        // Peak volume at center (0.4 to compensate for overlap addition)
+        env.gain.linearRampToValueAtTime(0.4, centerT); 
+        env.gain.linearRampToValueAtTime(0, endT);
+        
+        src.start(startT, offset);
+        src.stop(endT + 0.05); // Cleanup
+        
+        grainTime += density;
+        safety++;
+    }
+    
+    // Master Release
+    voiceBus.gain.setValueAtTime(1, endTime - 0.15);
+    voiceBus.gain.linearRampToValueAtTime(0, endTime);
+  };
+
+  // --- Scheduler ---
+
+  const scheduleNotes = () => {
+    const currentBpm = bpmRef.current;
+    const currentNotes = notesRef.current;
+    
+    const secondsPerBeat = 60.0 / currentBpm;
+    const secondsPer16th = secondsPerBeat / 4; 
+    const currentStepLoop = stepIndexRef.current % GRID_COLS;
+    
+    // Auto-scroll the grid on playback
+    if (isPlaying && gridRef.current) {
+      const scrollPosition = currentStepLoop * CELL_WIDTH - gridRef.current.clientWidth / 2 + (CELL_WIDTH * 2);
+      // Simple scroll without smooth animation for performance
+      gridRef.current.scrollLeft = scrollPosition;
+    }
+
+    setPlaybackTime(currentStepLoop);
+
+    currentNotes.forEach(note => {
+      if (note.startTime === currentStepLoop) {
+        playNote(
+          note.midi, 
+          note.lyric, 
+          nextNoteTimeRef.current - audioContextRef.current.currentTime, 
+          (note.duration * secondsPer16th)
+        );
+      }
+    });
+  };
+
+  const scheduler = () => {
+    while (nextNoteTimeRef.current < audioContextRef.current.currentTime + 0.1) {
+      scheduleNotes();
+      const currentBpm = bpmRef.current;
+      nextNoteTimeRef.current += (60.0 / currentBpm) / 4;
+      stepIndexRef.current++;
+
+      // Stop after 2 loops of 32 steps (if needed for a limited demo)
+      if (stepIndexRef.current >= GRID_COLS * 2) {
+          if (playingRef.current) {
+            setIsPlaying(false);
+            playingRef.current = false;
+            if (schedulerRef.current) clearTimeout(schedulerRef.current);
+            stepIndexRef.current = 0; // Reset
+            setPlaybackTime(0);
+            if (gridRef.current) gridRef.current.scrollLeft = 0; // Reset scroll
+          }
+      }
+    }
+    
+    if (playingRef.current) {
+      schedulerRef.current = setTimeout(scheduler, 25);
+    }
+  };
+
+  const togglePlayback = async () => {
+    await initAudio();
+    if (isPlaying) {
+      setIsPlaying(false);
+      playingRef.current = false;
+      if (schedulerRef.current) clearTimeout(schedulerRef.current);
+    } else {
+      setIsPlaying(true);
+      playingRef.current = true;
+      stepIndexRef.current = 0;
+      nextNoteTimeRef.current = audioContextRef.current.currentTime + 0.05;
+      scheduler();
+    }
+  };
+
+  // --- Interaction ---
+
+  const handleGridPointerDown = (e) => {
+    // Only allow left click (primary button) for placing notes
+    if (e.button !== 0 && e.pointerType === 'mouse') return;
+    
+    // We only place a note if we are not dragging an existing note
+    if (e.target.closest('.note-bar') || e.target.closest('.resize-handle')) return;
+
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+
+    const colIndex = Math.floor(x / CELL_WIDTH);
+    const rowIndex = Math.floor(y / CELL_HEIGHT);
+
+    if (colIndex < 0 || colIndex >= GRID_COLS) return;
+    if (rowIndex < 0 || rowIndex >= PIANO_KEYS.length) return;
+
+    const midi = PIANO_KEYS[rowIndex].midi;
+       
+    const newNote = {
+      id: `n${Date.now()}`,
+      midi,
+      startTime: colIndex,
+      duration: 4, 
+      lyric: voicebank[0]?.name || 'Ah'
+    };
+    setNotes([...notes, newNote]);
+    setSelectedNoteId(newNote.id);
+    playNote(midi, newNote.lyric, 0, 0.5); 
+  };
+
+  const handleNotePointerDown = (e, note, type) => {
+    e.stopPropagation();
+    e.target.setPointerCapture(e.pointerId); 
+    
+    const clientX = e.clientX || (e.touches?.[0].clientX);
+    const clientY = e.clientY || (e.touches?.[0].clientY);
+
+    setDragState({
+      pointerId: e.pointerId,
+      type,
+      noteId: note.id,
+      startX: clientX,
+      startY: clientY,
+      initialStartTime: note.startTime,
+      initialMidi: note.midi,
+      initialDuration: note.duration
+    });
+    setSelectedNoteId(note.id);
+  };
+
+  const handlePointerMove = (e) => {
+    if (!dragState) return;
+    e.preventDefault(); 
+    
+    const clientX = e.clientX || (e.touches?.[0].clientX);
+    const clientY = e.clientY || (e.touches?.[0].clientY);
+
+    const deltaX = clientX - dragState.startX;
+    const deltaY = clientY - dragState.startY;
+
+    const colDelta = Math.round(deltaX / CELL_WIDTH);
+    const rowDelta = Math.round(deltaY / CELL_HEIGHT);
+
+    setNotes(prevNotes => prevNotes.map(n => {
+      if (n.id !== dragState.noteId) return n;
+
+      if (dragState.type === 'move') {
+        const newStart = Math.max(0, Math.min(GRID_COLS - 1, dragState.initialStartTime + colDelta));
+        const targetKeyIndex = PIANO_KEYS.findIndex(k => k.midi === dragState.initialMidi) + rowDelta;
+        
+        const validIndex = Math.max(0, Math.min(PIANO_KEYS.length - 1, targetKeyIndex));
+        const newMidi = PIANO_KEYS[validIndex].midi;
+
+        return { ...n, startTime: newStart, midi: newMidi };
+      } 
+      else if (dragState.type === 'resize') {
+        const newDuration = Math.max(1, dragState.initialDuration + colDelta);
+        return { ...n, duration: newDuration };
+      }
+      return n;
+    }));
+  };
+
+  const handlePointerUp = (e) => {
+    if (!dragState) return;
+    e.target.releasePointerCapture(e.pointerId);
+    
+    const note = notes.find(n => n.id === dragState.noteId);
+    if (note && dragState.type === 'move' && note.midi !== dragState.initialMidi) {
+       playNote(note.midi, note.lyric, 0, 0.2);
+    }
+
+    setDragState(null);
+  };
+
+  return (
+    <div 
+      className="flex flex-col h-screen bg-slate-950 text-slate-200 font-sans overflow-hidden select-none"
+      onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerUp}
+      onPointerCancel={handlePointerUp}
+    >
+      {/* Header */}
+      <header className="h-14 bg-slate-900 border-b border-slate-800 flex items-center justify-between px-4 shrink-0 z-50">
+        <div className="flex items-center gap-2">
+          <div className="w-7 h-7 bg-indigo-600 rounded-lg flex items-center justify-center text-white font-bold text-sm">P</div>
+          <h1 className="font-bold text-lg hidden sm:block">Pocket<span className="text-indigo-400">Vocaloid</span></h1>
+        </div>
+        
+        <div className="flex bg-slate-800 rounded-lg p-1 gap-1">
+          <button onClick={() => setActiveTab('voicebank')} className={`px-3 py-1 rounded text-xs font-bold ${activeTab === 'voicebank' ? 'bg-indigo-600 text-white' : 'text-slate-400'}`}>REC</button>
+          <button onClick={() => setActiveTab('studio')} className={`px-3 py-1 rounded text-xs font-bold ${activeTab === 'studio' ? 'bg-indigo-600 text-white' : 'text-slate-400'}`}>EDIT</button>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-slate-400 font-mono">BPM</span>
+          <input 
+            type="number" 
+            value={bpm} 
+            onChange={(e) => setBpm(Number(e.target.value))}
+            className="bg-slate-800 rounded px-1 py-1 w-12 text-center text-xs font-mono focus:outline-none focus:ring-1 ring-indigo-500"
+          />
+        </div>
+      </header>
+
+      {/* Main Content */}
+      <main className="flex-1 overflow-hidden relative">
+        
+        {/* === VOICEBANK TAB === */}
+        {activeTab === 'voicebank' && (
+          <div className="h-full overflow-y-auto p-4 pb-20">
+            <div className="max-w-2xl mx-auto space-y-4">
+              <div className="bg-indigo-900/20 border border-indigo-500/30 p-4 rounded-xl flex items-start gap-3">
+                 <AlertCircle className="text-indigo-400 shrink-0 mt-1" size={20} />
+                 <div className="text-sm text-slate-300">
+                    <p className="font-bold text-indigo-300 mb-1">How to fix pitch:</p>
+                    <p>When recording, try to sing a steady <strong>C4 (Middle C)</strong>. Change the <strong>"Root Note"</strong> dropdown if you sing higher/lower. The granular synth works best with vowel sounds.</p>
+                 </div>
+              </div>
+
+              {voicebank.map((slot) => (
+                <div key={slot.id} className="bg-slate-900 border border-slate-800 rounded-xl p-4 shadow-sm">
+                  <div className="flex items-center gap-3 mb-3">
+                    <input 
+                      value={slot.name}
+                      onChange={(e) => setVoicebank(curr => curr.map(v => v.id === slot.id ? {...v, name: e.target.value} : v))}
+                      className="bg-transparent text-white font-bold text-xl w-full focus:outline-none border-b border-transparent focus:border-indigo-500 placeholder-slate-600"
+                      placeholder="Phoneme Name (e.g., Ah, Oo, Ee)"
+                    />
+                    <button onClick={() => setVoicebank(curr => curr.filter(v => v.id !== slot.id))} className="p-2 text-slate-600 hover:text-red-400">
+                      <Trash2 size={18} />
+                    </button>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-4">
+                    <RecordButton onRecord={() => handleRecord(slot.id)} hasBuffer={!!slot.buffer} />
+                    
+                    <button 
+                      onClick={() => playNote(slot.rootNote, slot.name, 0, 1.5)} // Longer preview
+                      disabled={!slot.buffer}
+                      className="w-12 h-12 rounded-full bg-slate-800 text-indigo-400 flex items-center justify-center hover:bg-slate-700 disabled:opacity-30 border border-slate-700"
+                    >
+                      <Volume2 size={20} />
+                    </button>
+
+                    <div className="flex flex-col gap-1 min-w-[100px]">
+                      <label className="text-[10px] text-slate-500 uppercase font-bold tracking-wider">Root Note</label>
+                      <select 
+                        value={slot.rootNote}
+                        onChange={(e) => setVoicebank(curr => curr.map(v => v.id === slot.id ? {...v, rootNote: parseInt(e.target.value)} : v))}
+                        className="bg-slate-800 text-xs text-slate-300 py-1.5 px-2 rounded border border-slate-700 outline-none"
+                      >
+                         {NOTES.map(n => <option key={n} value={getMidiNote(n, 4)}>{n}4 (Default)</option>)}
+                         {NOTES.map(n => <option key={n} value={getMidiNote(n, 3)}>{n}3 (Low)</option>)}
+                         {NOTES.map(n => <option key={n} value={getMidiNote(n, 5)}>{n}5 (High)</option>)}
+                      </select>
+                    </div>
+                  </div>
+                </div>
+              ))}
+              
+              <button 
+                onClick={() => setVoicebank([...voicebank, { id: `vb${Date.now()}`, name: 'New', buffer: null, duration: 0, rootNote: 60 }])}
+                className="w-full py-4 border-2 border-dashed border-slate-800 rounded-xl text-slate-500 hover:text-indigo-400 hover:bg-slate-900/50 transition-all font-medium flex items-center justify-center gap-2"
+              >
+                <Plus size={20} /> Add New Phoneme
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* === STUDIO TAB === */}
+        {activeTab === 'studio' && (
+          <div className="h-full flex flex-col">
+            {/* Toolbar */}
+            <div className="h-12 bg-slate-900 border-b border-slate-800 flex items-center px-4 justify-between shrink-0 z-10 shadow-md">
+              <Button onClick={togglePlayback} variant={isPlaying ? 'primary' : 'secondary'} className="w-full sm:w-auto">
+                {isPlaying ? <><Square size={14} fill="currentColor" /> Stop</> : <><Play size={16} fill="currentColor" /> Play</>}
+              </Button>
+              
+              {selectedNoteId && (
+                <div className="flex items-center gap-2 animate-in fade-in slide-in-from-right-4 duration-300">
+                  <input 
+                    type="text" 
+                    value={notes.find(n => n.id === selectedNoteId)?.lyric || ''}
+                    onChange={(e) => setNotes(notes.map(n => n.id === selectedNoteId ? { ...n, lyric: e.target.value } : n))}
+                    className="bg-slate-800 border border-slate-600 rounded px-2 py-1.5 text-xs w-20 text-center focus:border-indigo-500 focus:outline-none text-white"
+                    placeholder="Phoneme"
+                  />
+                  <button 
+                    onClick={() => { setNotes(notes.filter(n => n.id !== selectedNoteId)); setSelectedNoteId(null); }}
+                    className="bg-red-500/10 text-red-400 p-2 rounded-lg hover:bg-red-500/20"
+                  >
+                    <Trash2 size={16} />
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* Piano Roll */}
+            <div className="flex-1 overflow-auto relative custom-scrollbar bg-slate-950 touch-pan-x touch-pan-y" ref={gridRef}>
+              <div className="flex relative" style={{ minWidth: '100%', width: 'max-content' }}>
+                
+                {/* Sticky Keys Column */}
+                <div className="sticky left-0 z-30 w-12 sm:w-16 bg-slate-900 border-r border-slate-800 shadow-xl">
+                   {PIANO_KEYS.map((key) => {
+                     const isBlack = key.note.includes('#');
+                     return (
+                       <div 
+                         key={key.midi} 
+                         className={`flex items-center justify-center sm:justify-end sm:pr-2 text-[10px] sm:text-xs font-bold border-b border-slate-800/50
+                           ${isBlack ? 'bg-slate-800 text-slate-500' : 'bg-slate-300 text-slate-800'}
+                         `}
+                         style={{ height: `${CELL_HEIGHT}px` }}
+                       >
+                         {key.note}
+                       </div>
+                     );
+                   })}
+                </div>
+
+                {/* Grid */}
+                <div 
+                  className="relative touch-none" 
+                  style={{ 
+                    width: `${GRID_COLS * CELL_WIDTH}px`, 
+                    height: `${PIANO_KEYS.length * CELL_HEIGHT}px`,
+                    backgroundSize: `${CELL_WIDTH * 4}px ${CELL_HEIGHT * 12}px`, 
+                  }}
+                  onPointerDown={handleGridPointerDown}
+                >
+                   {/* Background Grid Lines (CSS) */}
+                   <div className="absolute inset-0 pointer-events-none opacity-20"
+                      style={{
+                        backgroundImage: `
+                          linear-gradient(to right, #334155 1px, transparent 1px),
+                          linear-gradient(to bottom, #334155 1px, transparent 1px)
+                        `,
+                        backgroundSize: `${CELL_WIDTH}px ${CELL_HEIGHT}px`
+                      }}
+                   />
+                   {/* Beat markers */}
+                   <div className="absolute inset-0 pointer-events-none opacity-30"
+                      style={{
+                        backgroundImage: `linear-gradient(to right, #94a3b8 1px, transparent 1px)`,
+                        backgroundSize: `${CELL_WIDTH * 4}px ${CELL_HEIGHT}px`
+                      }}
+                   />
+
+                   {/* Playhead */}
+                   {isPlaying && (
+                      <div 
+                        className="absolute top-0 bottom-0 w-[2px] bg-red-500 z-20 pointer-events-none shadow-[0_0_10px_rgba(239,68,68,0.8)]"
+                        style={{ left: `${playbackTime * CELL_WIDTH}px`, transition: 'left 0.1s linear' }}
+                      />
+                   )}
+
+                   {/* Notes */}
+                   {notes.map((note) => {
+                     const rowIndex = PIANO_KEYS.findIndex(k => k.midi === note.midi);
+                     if (rowIndex === -1) return null;
+                     const isSelected = selectedNoteId === note.id;
+
+                     return (
+                       <div
+                         key={note.id}
+                         className={`absolute rounded-md text-[10px] flex items-center px-2 overflow-hidden select-none touch-none note-bar
+                           ${isSelected 
+                             ? 'bg-indigo-500 ring-2 ring-white z-20 shadow-lg' 
+                             : 'bg-indigo-600/90 text-indigo-100 z-10 shadow-md'}
+                         `}
+                         style={{
+                           top: `${rowIndex * CELL_HEIGHT + 2}px`,
+                           height: `${CELL_HEIGHT - 4}px`,
+                           left: `${note.startTime * CELL_WIDTH}px`,
+                           width: `${note.duration * CELL_WIDTH}px`,
+                           cursor: 'move',
+                         }}
+                         onPointerDown={(e) => handleNotePointerDown(e, note, 'move')}
+                       >
+                         <span className="font-bold truncate pointer-events-none">{note.lyric}</span>
+                         
+                         {/* Resize Handle */}
+                         <div 
+                            className="absolute right-0 top-0 bottom-0 w-6 bg-black/10 hover:bg-white/20 cursor-e-resize flex items-center justify-center touch-none resize-handle"
+                            onPointerDown={(e) => handleNotePointerDown(e, note, 'resize')}
+                         >
+                            <GripVertical size={12} className="opacity-50 pointer-events-none" />
+                         </div>
+                       </div>
+                     );
+                   })}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+      </main>
+
+      <style jsx global>{`
+        .custom-scrollbar::-webkit-scrollbar { width: 8px; height: 8px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: #0f172a; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
+        .note-bar {
+            /* Ensures pointer events are handled correctly for moving/resizing */
+            touch-action: none;
+        }
+      `}</style>
+    </div>
+  );
+}
+
+// --- Record Button Component ---
+function RecordButton({ onRecord, hasBuffer }) {
+  const [isRecording, setIsRecording] = useState(false);
+  const stopRef = useRef(null);
+
+  const start = async () => {
+    setIsRecording(true);
+    stopRef.current = await onRecord();
+  };
+
+  const stop = () => {
+    if (stopRef.current) stopRef.current();
+    setIsRecording(false);
+  };
+
+  return (
+    <button
+      onPointerDown={start}
+      onPointerUp={stop}
+      onPointerLeave={() => isRecording && stop()}
+      className={`w-16 h-16 rounded-full flex items-center justify-center transition-all duration-100 ${
+        isRecording 
+        ? 'bg-red-500 scale-110 shadow-[0_0_20px_rgba(239,68,68,0.6)]' 
+        : hasBuffer 
+          ? 'bg-slate-700 text-green-400 border-2 border-green-500/50'
+          : 'bg-slate-800 text-red-500 border-2 border-slate-700'
+      }`}
+    >
+      {isRecording ? <div className="w-6 h-6 bg-white rounded animate-pulse" /> : <Mic size={28} />}
+    </button>
+  );
+}
+
 
